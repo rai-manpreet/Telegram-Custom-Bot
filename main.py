@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Replace with your bot token
 ALLOWED_CHAT_ID = 12345678  # Only this chat ID can use the bot
 BEARER_TOKEN = "YOUR_BEARER_TOKEN_HERE"  # Replace with your bearer token for upscale API
+BOT_USERNAME = "BOT_USERNAME"  # Replace with your bot's username (without @)
 
 # API endpoints
 CAPTION_ENDPOINT = "https://example.com/generate-captions"
@@ -36,8 +37,39 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Welcome! Send me:\n"
         "📷 An image - I'll give you upscale or thumbnail options\n"
-        "📝 Text - I'll generate captions for you"
+        "📝 Text - I'll generate captions for you\n"
+        "📤 Use /share to get the group link\n"
+        "🏷️ Use /rename to rename image files"
     )
+
+async def share(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Share command handler - returns HTML formatted message with bot link"""
+    if not check_chat_permission(update.effective_chat.id):
+        await update.message.reply_text("You are not authorized to use this bot.")
+        return
+    
+    # HTML formatted message
+    share_message = f"""Telegram ⤵
+<a href="https://t.me/{BOT_USERNAME}">t.me/{BOT_USERNAME}</a>"""
+    
+    await update.message.reply_text(
+        share_message,
+        parse_mode='HTML',
+        disable_web_page_preview=True
+    )
+
+async def rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Rename command handler - initiates the rename process"""
+    if not check_chat_permission(update.effective_chat.id):
+        await update.message.reply_text("You are not authorized to use this bot.")
+        return
+    
+    await update.message.reply_text(
+        "📸 Please send me a photo or image document that you want to rename."
+    )
+    
+    # Set user state to waiting for image
+    context.user_data['waiting_for_rename_image'] = True
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle text messages"""
@@ -45,6 +77,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     
     text = update.message.text
+    
+    # Check if user is in rename process and waiting for new filename
+    if context.user_data.get('waiting_for_rename_filename'):
+        await process_rename_with_filename(update, context, text)
+        return
     
     # Send typing indicator
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -72,6 +109,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle image messages (both photos and documents)"""
     if not check_chat_permission(update.effective_chat.id):
+        return
+    
+    # Check if user is in rename process
+    if context.user_data.get('waiting_for_rename_image'):
+        await process_rename_image(update, context)
         return
     
     # Handle both photo and document types
@@ -302,6 +344,88 @@ async def process_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         logger.error(f"Unexpected error in process_thumbnail: {e}")
         await query.edit_message_text("❌ An unexpected error occurred during thumbnail generation.")
 
+async def process_rename_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle image received for renaming"""
+    # Store the image file_id for renaming
+    if update.message.photo:
+        # Get the largest photo size
+        photo = update.message.photo[-1]
+        context.user_data['rename_file_id'] = photo.file_id
+        context.user_data['rename_file_type'] = 'photo'
+    elif update.message.document and update.message.document.mime_type.startswith('image/'):
+        # Handle document images
+        document = update.message.document
+        context.user_data['rename_file_id'] = document.file_id
+        context.user_data['rename_file_type'] = 'document'
+    else:
+        await update.message.reply_text("❌ Please send a valid image file.")
+        return
+    
+    # Clear the waiting flag and set new flag
+    context.user_data['waiting_for_rename_image'] = False
+    context.user_data['waiting_for_rename_filename'] = True
+    
+    await update.message.reply_text(
+        "✅ Image received! Now please send me the new filename (without extension).\n"
+        "Example: my_new_image\n"
+        "The file will be saved as: your_name.png"
+    )
+
+async def process_rename_with_filename(update: Update, context: ContextTypes.DEFAULT_TYPE, filename: str) -> None:
+    """Process the rename with the provided filename"""
+    try:
+        # Get the stored file_id
+        file_id = context.user_data.get('rename_file_id')
+        if not file_id:
+            await update.message.reply_text("❌ Error: No image found. Please start over with /rename")
+            # Clear user data
+            context.user_data.clear()
+            return
+        
+        # Clean the filename (remove special characters, keep only alphanumeric, spaces, hyphens, underscores)
+        import re
+        clean_filename = re.sub(r'[^\w\s\-_]', '', filename.strip())
+        clean_filename = clean_filename.replace(' ', '_')  # Replace spaces with underscores
+        
+        if not clean_filename:
+            await update.message.reply_text("❌ Please provide a valid filename with letters, numbers, spaces, hyphens, or underscores only.")
+            return
+        
+        # Add .png extension
+        new_filename = f"{clean_filename}.png"
+        
+        # Send processing message
+        processing_msg = await update.message.reply_text("🔄 Renaming your image... Please wait.")
+        
+        # Get the file and download it
+        file = await context.bot.get_file(file_id)
+        file_bytes = BytesIO()
+        await file.download_to_memory(file_bytes)
+        file_bytes.seek(0)
+        
+        # Set the filename for the BytesIO object
+        file_bytes.name = new_filename
+        
+        # Send the renamed file back as document
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=file_bytes,
+            filename=new_filename,
+            caption=f"✅ Image renamed to: {new_filename}"
+        )
+        
+        # Delete processing message
+        await processing_msg.delete()
+        
+        # Clear user data
+        context.user_data.clear()
+        
+    except Exception as e:
+        logger.error(f"Error in process_rename_with_filename: {e}")
+        await update.message.reply_text("❌ An error occurred while renaming the image. Please try again.")
+        # Clear user data on error
+        context.user_data.clear()
+
 def main() -> None:
     """Start the bot"""
     # Create the Application
@@ -309,6 +433,8 @@ def main() -> None:
     
     # Add handlers
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("share", share))  # Add share command handler
+    application.add_handler(CommandHandler("rename", rename))  # Add rename command handler
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(MessageHandler(filters.PHOTO, handle_image))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_image))  # Handle document images
